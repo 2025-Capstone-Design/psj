@@ -1,0 +1,6 @@
+numpy
+matplotlib pyplot
+MinMaxScaler
+Sequential
+LSTM, Dense
+pandas
