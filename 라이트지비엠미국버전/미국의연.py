@@ -56,16 +56,13 @@ df = pd.merge(df, max_potential, on=['DayOfWeek', 'Hour'], how='left')
 # 4. 시간 지연 변수 (Lagged Features) 추가 및 최종 피처 정의
 # ----------------------------------------------------
 LAGS = [24, 24*7] 
-# Lagged Feature 생성 시, 예측 시작일 이전의 데이터만 사용하여 shift를 수행합니다.
 df_train_only = df[df['FlightDateTime'] < future_start_dt].copy()
 
 for lag in LAGS:
     df_train_only[f'{TARGET}_Lag_{lag}'] = df_train_only[TARGET].shift(lag)
 
-# 전체 데이터프레임에 Lagged Feature를 병합합니다. (이때 NaN이 생기는 행은 모델 학습에서 제외)
 df = pd.merge(df, df_train_only[[f'{TARGET}_Lag_{lag}' for lag in LAGS] + ['FlightDateTime']], 
               on='FlightDateTime', how='left')
-
 df.dropna(subset=[f'{TARGET}_Lag_{lag}' for lag in LAGS], inplace=True) 
 
 LAGGED_FEATURES = [f'{TARGET}_Lag_{lag}' for lag in LAGS]
@@ -76,7 +73,7 @@ CATEGORICAL_FEATURES = ['Month', 'DayOfWeek', 'Hour']
 for col in CATEGORICAL_FEATURES:
     df[col] = df[col].astype('category')
 
-# 5. 모델 학습 (안정화 파라미터 적용)
+# 5. 모델 학습 
 # ----------------------------------------------------
 train_df = df[df['FlightDateTime'] < future_start_dt].copy()
 X_train = train_df[ALL_FEATURES]
@@ -84,17 +81,9 @@ y_train = train_df[TARGET]
 
 print("🚀 LightGBM 모델 학습 시작 (최종 안정화 파라미터 적용)...")
 lgbm = lgb.LGBMRegressor(
-    objective='rmse', 
-    n_estimators=1000, 
-    learning_rate=0.02, # 학습률 감소
-    num_leaves=31,
-    random_state=42, 
-    n_jobs=-1, 
-    metric='rmse', 
-    categorical_feature=CATEGORICAL_FEATURES,
-    lambda_l1=0.5,  # 정규화 추가
-    lambda_l2=0.5,  # 정규화 추가
-    min_child_samples=30 # 최소 샘플 수 증가
+    objective='rmse', n_estimators=1000, learning_rate=0.02, num_leaves=31, random_state=42, 
+    n_jobs=-1, metric='rmse', categorical_feature=CATEGORICAL_FEATURES,
+    lambda_l1=0.5, lambda_l2=0.5, min_child_samples=30
 )
 lgbm.fit(X_train, y_train)
 print("✅ LightGBM 모델 학습 완료.")
@@ -115,38 +104,54 @@ future_df = pd.merge(future_df.reset_index(), max_potential, on=['DayOfWeek', 'H
 
 all_data = pd.concat([df.set_index('FlightDateTime'), future_df])
 train_df_index = df.set_index('FlightDateTime')
-LAG_168H = f'{TARGET}_Lag_{LAGS[-1]}'
 
-print("🔄 재귀적 예측 수행 중... (1년 예측)")
+# ⭐️ [핵심 변수] 예측값 평활화를 위한 가중치 설정 (이전 예측값 70%, 새로운 예측값 30% 반영)
+SMOOTHING_WEIGHT = 0.7 
+LAST_ACTUAL_VALUE = df[df['FlightDateTime'] < future_start_dt].sort_values('FlightDateTime').iloc[-1][TARGET]
+
+print("🔄 재귀적 예측 수행 중... (예측값 평활화 적용)")
+
+# 예측 시작 전 마지막 실제 값으로 초기 예측값을 설정 (불연속성 완화)
+all_data.loc[future_index[0], TARGET] = LAST_ACTUAL_VALUE 
 
 for i in range(len(future_df)):
     current_dt = future_df.index[i]
     
-    # ⭐️ Lagged Feature를 가져오는 로직 개선: 과거 데이터 인덱스를 사용하여 명확하게 참조
+    # Lagged Feature 참조
     for lag in LAGS:
         past_dt = current_dt - pd.Timedelta(hours=lag)
         if past_dt in all_data.index:
-             # 예측 구간에서는 예측값을, 학습 구간에서는 학습된 값을 참조합니다.
             all_data.loc[current_dt, f'{TARGET}_Lag_{lag}'] = all_data.loc[past_dt, TARGET]
-        # 만약 과거 데이터가 없으면 (가장 초반 예측), NaN이 되도록 둡니다.
-        # 이 NaN은 아래 Historical Max 로직으로 처리됩니다.
     
     X_future_row = all_data.loc[[current_dt], ALL_FEATURES]
     
-    # 예측 시작 후 7일 이내 (T-168 Lagged Feature가 NaN일 경우) Historical Max 사용
-    if X_future_row[LAG_168H].isna().iloc[0] or X_future_row[LAGGED_FEATURES].isna().any(axis=1).iloc[0]:
-        pred_value = X_future_row[f'{TARGET}_Historical_Max'].iloc[0]
-    else:
-        for col in CATEGORICAL_FEATURES:
-            X_future_row[col] = X_future_row[col].astype('category')
-        pred_value = lgbm.predict(X_future_row)[0]
+    # Lagged Feature에 NaN이 있다면 Historical Max로 강제 대체
+    if X_future_row[LAGGED_FEATURES].isna().any(axis=1).iloc[0]:
+        for lag_col in LAGGED_FEATURES:
+            if X_future_row[lag_col].isna().iloc[0]:
+                X_future_row.loc[X_future_row.index, lag_col] = X_future_row[f'{TARGET}_Historical_Max'].iloc[0]
+        
+    for col in CATEGORICAL_FEATURES:
+        X_future_row[col] = X_future_row[col].astype('category')
     
-    all_data.loc[current_dt, TARGET] = pred_value
+    # 모델 예측
+    new_pred_value = lgbm.predict(X_future_row)[0]
+    
+    # ⭐️ [핵심 수정] 예측값 평활화 적용
+    if i == 0:
+        # 첫 번째 예측은 초기값(LAST_ACTUAL_VALUE)과 새로운 예측값의 가중평균
+        smoothed_pred_value = (LAST_ACTUAL_VALUE * SMOOTHING_WEIGHT) + (new_pred_value * (1 - SMOOTHING_WEIGHT))
+    else:
+        # 이전 예측값과 새로운 예측값의 가중평균
+        previous_pred_value = all_data.loc[future_index[i-1], TARGET]
+        smoothed_pred_value = (previous_pred_value * SMOOTHING_WEIGHT) + (new_pred_value * (1 - SMOOTHING_WEIGHT))
+        
+    all_data.loc[current_dt, TARGET] = smoothed_pred_value
 
-# ⭐️ [시각화 데이터 최종 수정] 파란색 선이 11월 이후에 표시되는 오류 방지
+# 7. 시각화 데이터 병합 및 그래프 생성
+# ----------------------------------------------------
 final_future_predictions = all_data.loc[future_index, TARGET].reset_index().rename(columns={TARGET: 'Predicted_MaxWait'})
 
-# 파란색 선은 예측 시작일 전의 원본 데이터만 포함 (2025-11-01 직전까지)
 train_data_for_plot = df_original_for_plot[
     df_original_for_plot['FlightDateTime'] < future_start_dt
 ].rename(columns={'Actual_MaxWait_Original': 'Actual_MaxWait'}).copy()
@@ -167,8 +172,6 @@ full_data_melted['Type'] = full_data_melted['Type'].replace({
     'Predicted_MaxWait': '예측 혼잡도 (안정화 모델)'
 })
 
-# 7. Plotly 대화형 그래프 시각화
-# ----------------------------------------------------
 full_data_melted = full_data_melted.sort_values('FlightDateTime').reset_index(drop=True)
 full_data_melted['MaxWait_Smoothed'] = full_data_melted.groupby('Type')['MaxWait'].transform(
     lambda x: x.rolling(window=168, center=True, min_periods=1).median()
@@ -207,7 +210,7 @@ fig.add_vrect(
 )
 
 fig.update_layout(
-    title='✈️ LAX 최대 대기 시간 예측 및 혼잡도 패턴 분석 (예측 비현실성 최종 해결)',
+    title='✈️ Los Angeles 살고있는 의연이 분석',
     yaxis_title='최대 대기 시간 (분)',
     xaxis_title='날짜', height=700, hovermode="x unified", legend_title_text='데이터 종류', template='plotly_white'
 )
@@ -222,5 +225,4 @@ fig.update_xaxes(
     )
 )
 
-# 그래프 출력
 fig.show()
