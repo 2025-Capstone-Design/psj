@@ -4,11 +4,10 @@ import lightgbm as lgb
 import plotly.express as px
 import plotly.graph_objects as go
 import warnings
-# 경고 메시지 무시 설정
 warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
 
-# 1. 환경 설정 및 데이터 로드 (1년 주기로 변경)
+# 1. 환경 설정 및 데이터 로드 
 # ----------------------------------------------------
 # 🚨 1. [필수 수정] 새로 다운로드 받은 1년치 파일 경로와 이름으로 변경하세요.
 FILE_PATH = "Awt.cbp.gov_LAX_2024-11-01_to_2025-10-31.csv" 
@@ -29,16 +28,18 @@ df_raw['FlightDate'] = pd.to_datetime(df_raw['FlightDate'])
 df_raw['Hour'] = df_raw['HourRange'].str.split(' ').str[0].astype(int)
 df_raw['FlightDateTime'] = df_raw.apply(lambda row: row['FlightDate'] + pd.Timedelta(hours=row['Hour'], minutes=30), axis=1)
 df_agg = df_raw.groupby('FlightDateTime')[TARGET].max().reset_index()
+
+# ⭐️ 시각화용 원본 데이터 복사본 생성 (조작하지 않음)
+df_original_for_plot = df_agg.copy().rename(columns={TARGET: 'Actual_MaxWait_Original'})
+
+# ⭐️ [수정] 학습 데이터(df)는 이상치 처리를 위해 df_agg에서 복사
 df = df_agg.rename(columns={TARGET: TARGET})
 
-# ⭐️ [최종 수정] 학습 데이터의 극단적인 이상치(상위 1%)를 제거하여 예측 안정화
+# ⭐️ [최종 수정] 모델 학습 안정화를 위해 이상치 처리 (Capping)를 df에만 적용
 train_df_for_outlier = df[df['FlightDateTime'] < PREDICTION_START_DATE].copy()
-# MaxWait 값의 99% 백분위수(Percentile) 계산
 threshold = train_df_for_outlier[TARGET].quantile(0.99)
-print(f"💡 MaxWait 이상치 제거 임계값 (상위 1%): {threshold:.0f}분")
-
-# 임계값보다 큰 MaxWait 값을 임계값으로 대체 (Capping)
-# MaxWait = min(MaxWait, threshold)
+print(f"💡 LightGBM 학습용 MaxWait 이상치 제거 임계값 (상위 1%): {threshold:.0f}분")
+# 학습 데이터 MaxWait 값만 임계값으로 대체 (Capping)
 df[TARGET] = np.where(df[TARGET] > threshold, threshold, df[TARGET])
 
 
@@ -137,9 +138,9 @@ for i in range(len(future_df)):
     
     all_data.loc[current_dt, TARGET] = pred_value
 
-# 최종 데이터프레임 정리 및 범례 수정
+# ⭐️ [최종 수정] 시각화 데이터 병합: 학습 데이터 대신 원본 데이터를 사용
 final_future_predictions = all_data.loc[future_index, TARGET].reset_index().rename(columns={TARGET: 'Predicted_MaxWait'})
-train_data_for_plot = train_df[['FlightDateTime', TARGET]].rename(columns={TARGET: 'Actual_MaxWait'}).copy()
+train_data_for_plot = df_original_for_plot.rename(columns={'Actual_MaxWait_Original': 'Actual_MaxWait'}).copy()
 train_data_for_plot['Predicted_MaxWait'] = np.nan
 future_data_for_plot = final_future_predictions
 future_data_for_plot['Actual_MaxWait'] = np.nan
@@ -151,22 +152,28 @@ full_data_melted = pd.melt(
 ).dropna(subset=['MaxWait'])
 
 full_data_melted['Type'] = full_data_melted['Type'].replace({
-    'Actual_MaxWait': '실제 혼잡도 (1년 학습)',
-    'Predicted_MaxWait': '예측 혼잡도 (1년 예측)'
+    'Actual_MaxWait': '실제 혼잡도 (원본 데이터)',
+    'Predicted_MaxWait': '예측 혼잡도 (안정화 모델)'
 })
 
 # 7. Plotly 대화형 그래프 시각화
 # ----------------------------------------------------
 full_data_melted = full_data_melted.sort_values('FlightDateTime').reset_index(drop=True)
+
+# 롤링 중앙값 계산 시 MaxWait은 원본 데이터를 기반으로 계산되어야 함.
 full_data_melted['MaxWait_Smoothed'] = full_data_melted.groupby('Type')['MaxWait'].transform(
     lambda x: x.rolling(window=168, center=True, min_periods=1).median()
 )
 
 print("📊 가독성 개선된 대화형 그래프 생성 중...")
 fig = go.Figure()
-MAX_Y = full_data_melted['MaxWait'].max() * 1.05
 
-# 혼잡 수준 강조 영역
+# ⭐️ Y축 최대값은 원본 데이터의 최대값과 예측 데이터의 최대값 중 큰 값으로 설정
+max_actual = df_original_for_plot['Actual_MaxWait_Original'].max()
+max_predicted = final_future_predictions['Predicted_MaxWait'].max()
+MAX_Y = max(max_actual, max_predicted) * 1.05
+
+# 혼잡 수준 강조 영역 (Y축 범위가 원본을 반영하여 확장됨)
 fig.add_hrect(y0=60, y1=120, fillcolor="yellow", opacity=0.1, line_width=0, annotation_text="지연 경고 (60분 초과)", annotation_position="top left")
 fig.add_hrect(y0=120, y1=MAX_Y, fillcolor="red", opacity=0.15, line_width=0, annotation_text="심각 혼잡 (120분 초과)", annotation_position="top left")
 
@@ -199,7 +206,7 @@ fig.add_vrect(
 
 # 최종 레이아웃 및 스크롤 기능 설정
 fig.update_layout(
-    title='✈️ LAX 최대 대기 시간 예측 및 혼잡도 패턴 분석 (이상치 제거 및 안정화)',
+    title='✈️ LAX 최대 대기 시간 예측 및 혼잡도 패턴 분석 (시각화 원본 유지 및 예측 안정화)',
     yaxis_title='최대 대기 시간 (분)',
     xaxis_title='날짜', height=700, hovermode="x unified", legend_title_text='데이터 종류', template='plotly_white'
 )
