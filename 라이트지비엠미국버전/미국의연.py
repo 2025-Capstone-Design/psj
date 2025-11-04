@@ -13,6 +13,7 @@ FILE_PATH = "Awt.cbp.gov_LAX_2024-11-01_to_2025-10-31.csv"
 TARGET = 'MaxWait'
 PREDICTION_START_DATE = '2025-11-01 00:00:00' 
 PREDICTION_END_DATE = '2026-10-31 23:00:00' 
+LAGS = [24, 24*7] # Lagged Feature 설정
 
 try:
     df_raw = pd.read_csv(FILE_PATH)
@@ -38,7 +39,7 @@ threshold = train_df_for_outlier[TARGET].quantile(0.99)
 print(f"💡 LightGBM 학습용 MaxWait 이상치 제거 임계값 (상위 1%): {threshold:.0f}분")
 df[TARGET] = np.where(df[TARGET] > threshold, threshold, df[TARGET])
 
-# 시계열 피처 생성
+# 시계열 및 Historical Max 피처 생성
 df['Year'] = df['FlightDateTime'].dt.year
 df['Month'] = df['FlightDateTime'].dt.month
 df['Day'] = df['FlightDateTime'].dt.day
@@ -46,21 +47,15 @@ df['DayOfWeek'] = df['FlightDateTime'].dt.dayofweek
 df['Hour'] = df['FlightDateTime'].dt.hour
 df['WeekOfYear'] = df['FlightDateTime'].dt.isocalendar().week.astype(int)
 
-# 3. 학습 데이터에서 '역사적 최대 잠재력' 피처 생성
-# ----------------------------------------------------
 train_df_temp = df[df['FlightDateTime'] < future_start_dt].copy()
 max_potential = train_df_temp.groupby(['DayOfWeek', 'Hour'])[TARGET].max().reset_index()
 max_potential.rename(columns={TARGET: f'{TARGET}_Historical_Max'}, inplace=True)
 df = pd.merge(df, max_potential, on=['DayOfWeek', 'Hour'], how='left')
 
-# 4. 시간 지연 변수 (Lagged Features) 추가 및 최종 피처 정의
-# ----------------------------------------------------
-LAGS = [24, 24*7] 
+# Lagged Feature 생성
 df_train_only = df[df['FlightDateTime'] < future_start_dt].copy()
-
 for lag in LAGS:
     df_train_only[f'{TARGET}_Lag_{lag}'] = df_train_only[TARGET].shift(lag)
-
 df = pd.merge(df, df_train_only[[f'{TARGET}_Lag_{lag}' for lag in LAGS] + ['FlightDateTime']], 
               on='FlightDateTime', how='left')
 df.dropna(subset=[f'{TARGET}_Lag_{lag}' for lag in LAGS], inplace=True) 
@@ -79,7 +74,7 @@ train_df = df[df['FlightDateTime'] < future_start_dt].copy()
 X_train = train_df[ALL_FEATURES]
 y_train = train_df[TARGET]
 
-print("🚀 LightGBM 모델 학습 시작 (최종 안정화 파라미터 적용)...")
+print("🚀 LightGBM 모델 학습 시작...")
 lgbm = lgb.LGBMRegressor(
     objective='rmse', n_estimators=1000, learning_rate=0.02, num_leaves=31, random_state=42, 
     n_jobs=-1, metric='rmse', categorical_feature=CATEGORICAL_FEATURES,
@@ -91,28 +86,30 @@ print("✅ LightGBM 모델 학습 완료.")
 # 6. 재귀적 예측 및 데이터 결합
 # ----------------------------------------------------
 future_end_dt = pd.to_datetime(PREDICTION_END_DATE)
-future_index = pd.date_range(start=future_start_dt, end=future_end_dt, freq='H')
+# ⭐️ [수정] freq='h'로 변경하여 FutureWarning 제거
+future_index = pd.date_range(start=future_start_dt, end=future_end_dt, freq='h')
 
 future_df = pd.DataFrame(index=future_index)
 future_df.index.name = 'FlightDateTime'
+
+# ⭐️ [핵심 수정] DayOfWeek, Hour 등 시계열 피처를 먼저 생성하여 KeyError 방지
 future_df['Month'] = future_df.index.month
 future_df['Day'] = future_df.index.day
 future_df['DayOfWeek'] = future_df.index.dayofweek
 future_df['Hour'] = future_df.index.hour
 future_df['WeekOfYear'] = future_df.index.isocalendar().week.astype(int)
+
+# 이제 DayOfWeek, Hour가 존재하므로 merge 가능
 future_df = pd.merge(future_df.reset_index(), max_potential, on=['DayOfWeek', 'Hour'], how='left').set_index('FlightDateTime')
 
 all_data = pd.concat([df.set_index('FlightDateTime'), future_df])
 train_df_index = df.set_index('FlightDateTime')
 
-# ⭐️ [핵심 변수] 예측값 평활화를 위한 가중치 설정 (이전 예측값 70%, 새로운 예측값 30% 반영)
-SMOOTHING_WEIGHT = 0.7 
-LAST_ACTUAL_VALUE = df[df['FlightDateTime'] < future_start_dt].sort_values('FlightDateTime').iloc[-1][TARGET]
+# Lagged Feature를 실제 값으로 참조할 기간 (7일 = 168시간)
+INITIAL_STABILIZATION_PERIOD = 24 * 7 
+train_df_last_168 = train_df_index.iloc[-INITIAL_STABILIZATION_PERIOD:]
 
-print("🔄 재귀적 예측 수행 중... (예측값 평활화 적용)")
-
-# 예측 시작 전 마지막 실제 값으로 초기 예측값을 설정 (불연속성 완화)
-all_data.loc[future_index[0], TARGET] = LAST_ACTUAL_VALUE 
+print("🔄 재귀적 예측 수행 중... (예측 패턴 복구 로직 적용)")
 
 for i in range(len(future_df)):
     current_dt = future_df.index[i]
@@ -120,12 +117,17 @@ for i in range(len(future_df)):
     # Lagged Feature 참조
     for lag in LAGS:
         past_dt = current_dt - pd.Timedelta(hours=lag)
-        if past_dt in all_data.index:
+        
+        # 초기 168시간 동안은 예측값 대신 학습 데이터의 실제 끝 값을 참조
+        if i < INITIAL_STABILIZATION_PERIOD and past_dt in train_df_last_168.index:
+            all_data.loc[current_dt, f'{TARGET}_Lag_{lag}'] = train_df_last_168.loc[past_dt, TARGET]
+        elif past_dt in all_data.index:
+            # 168시간 이후부터는 재귀적 예측값 참조
             all_data.loc[current_dt, f'{TARGET}_Lag_{lag}'] = all_data.loc[past_dt, TARGET]
-    
+            
     X_future_row = all_data.loc[[current_dt], ALL_FEATURES]
     
-    # Lagged Feature에 NaN이 있다면 Historical Max로 강제 대체
+    # Lagged Feature에 NaN이 있다면 Historical Max로 강제 대체 (안전장치 유지)
     if X_future_row[LAGGED_FEATURES].isna().any(axis=1).iloc[0]:
         for lag_col in LAGGED_FEATURES:
             if X_future_row[lag_col].isna().iloc[0]:
@@ -135,18 +137,9 @@ for i in range(len(future_df)):
         X_future_row[col] = X_future_row[col].astype('category')
     
     # 모델 예측
-    new_pred_value = lgbm.predict(X_future_row)[0]
-    
-    # ⭐️ [핵심 수정] 예측값 평활화 적용
-    if i == 0:
-        # 첫 번째 예측은 초기값(LAST_ACTUAL_VALUE)과 새로운 예측값의 가중평균
-        smoothed_pred_value = (LAST_ACTUAL_VALUE * SMOOTHING_WEIGHT) + (new_pred_value * (1 - SMOOTHING_WEIGHT))
-    else:
-        # 이전 예측값과 새로운 예측값의 가중평균
-        previous_pred_value = all_data.loc[future_index[i-1], TARGET]
-        smoothed_pred_value = (previous_pred_value * SMOOTHING_WEIGHT) + (new_pred_value * (1 - SMOOTHING_WEIGHT))
+    pred_value = lgbm.predict(X_future_row)[0]
         
-    all_data.loc[current_dt, TARGET] = smoothed_pred_value
+    all_data.loc[current_dt, TARGET] = pred_value
 
 # 7. 시각화 데이터 병합 및 그래프 생성
 # ----------------------------------------------------
@@ -169,7 +162,7 @@ full_data_melted = pd.melt(
 
 full_data_melted['Type'] = full_data_melted['Type'].replace({
     'Actual_MaxWait': '실제 혼잡도 (원본 데이터)',
-    'Predicted_MaxWait': '예측 혼잡도 (안정화 모델)'
+    'Predicted_MaxWait': '예측 혼잡도 (패턴 복구 모델)'
 })
 
 full_data_melted = full_data_melted.sort_values('FlightDateTime').reset_index(drop=True)
@@ -210,7 +203,7 @@ fig.add_vrect(
 )
 
 fig.update_layout(
-    title='✈️ Los Angeles 살고있는 의연이 분석',
+    title='✈️ LA 거주하는 의연이 분석',
     yaxis_title='최대 대기 시간 (분)',
     xaxis_title='날짜', height=700, hovermode="x unified", legend_title_text='데이터 종류', template='plotly_white'
 )
