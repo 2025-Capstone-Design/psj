@@ -30,6 +30,19 @@ df_raw['Hour'] = df_raw['HourRange'].str.split(' ').str[0].astype(int)
 df_raw['FlightDateTime'] = df_raw.apply(lambda row: row['FlightDate'] + pd.Timedelta(hours=row['Hour'], minutes=30), axis=1)
 df_agg = df_raw.groupby('FlightDateTime')[TARGET].max().reset_index()
 df = df_agg.rename(columns={TARGET: TARGET})
+
+# ⭐️ [최종 수정] 학습 데이터의 극단적인 이상치(상위 1%)를 제거하여 예측 안정화
+train_df_for_outlier = df[df['FlightDateTime'] < PREDICTION_START_DATE].copy()
+# MaxWait 값의 99% 백분위수(Percentile) 계산
+threshold = train_df_for_outlier[TARGET].quantile(0.99)
+print(f"💡 MaxWait 이상치 제거 임계값 (상위 1%): {threshold:.0f}분")
+
+# 임계값보다 큰 MaxWait 값을 임계값으로 대체 (Capping)
+# MaxWait = min(MaxWait, threshold)
+df[TARGET] = np.where(df[TARGET] > threshold, threshold, df[TARGET])
+
+
+# 시계열 피처 생성
 df['Year'] = df['FlightDateTime'].dt.year
 df['Month'] = df['FlightDateTime'].dt.month
 df['Day'] = df['FlightDateTime'].dt.day
@@ -58,29 +71,25 @@ CATEGORICAL_FEATURES = ['Month', 'DayOfWeek', 'Hour']
 for col in CATEGORICAL_FEATURES:
     df[col] = df[col].astype('category')
 
-# 5. 모델 학습 (⚠️ 안정화 파라미터 적용)
+# 5. 모델 학습 (안정화 파라미터 적용)
 # ----------------------------------------------------
 train_df = df[df['FlightDateTime'] < PREDICTION_START_DATE].copy()
 X_train = train_df[ALL_FEATURES]
 y_train = train_df[TARGET]
 
-print("🚀 LightGBM 모델 학습 시작 (안정화 파라미터 적용)...")
+print("🚀 LightGBM 모델 학습 시작 (이상치 제거 및 안정화 파라미터 적용)...")
 lgbm = lgb.LGBMRegressor(
     objective='rmse', 
     n_estimators=1000, 
-    # [수정 1: 학습률 감소] 급격한 예측 방지 (기존 0.05 -> 0.02)
-    learning_rate=0.02, 
+    learning_rate=0.02, # 학습률 감소
     num_leaves=31,
     random_state=42, 
     n_jobs=-1, 
     metric='rmse', 
     categorical_feature=CATEGORICAL_FEATURES,
-    
-    # [수정 2: 정규화 추가] 극단적인 값에 과적합 방지
-    lambda_l1=0.5,  # L1 정규화 계수
-    lambda_l2=0.5,  # L2 정규화 계수
-    # [수정 3: 최소 샘플 수 증가] 노이즈 분기 방지
-    min_child_samples=30
+    lambda_l1=0.5,  # 정규화 추가
+    lambda_l2=0.5,  # 정규화 추가
+    min_child_samples=30 # 최소 샘플 수 증가
 )
 lgbm.fit(X_train, y_train)
 print("✅ LightGBM 모델 학습 완료.")
@@ -120,7 +129,6 @@ for i in range(len(future_df)):
     X_future_row = all_data.loc[[current_dt], ALL_FEATURES]
     
     if X_future_row[LAG_168H].isna().iloc[0]:
-        # 예측 시작 후 7일간은 Historical Max로 초기값 설정 (단절 방지)
         pred_value = X_future_row[f'{TARGET}_Historical_Max'].iloc[0]
     else:
         for col in CATEGORICAL_FEATURES:
@@ -191,7 +199,7 @@ fig.add_vrect(
 
 # 최종 레이아웃 및 스크롤 기능 설정
 fig.update_layout(
-    title='✈️ LAX 최대 대기 시간 예측 및 혼잡도 패턴 분석 (1년 주기 반영 및 안정화)',
+    title='✈️ LAX 최대 대기 시간 예측 및 혼잡도 패턴 분석 (이상치 제거 및 안정화)',
     yaxis_title='최대 대기 시간 (분)',
     xaxis_title='날짜', height=700, hovermode="x unified", legend_title_text='데이터 종류', template='plotly_white'
 )
